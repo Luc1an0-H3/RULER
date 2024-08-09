@@ -42,6 +42,7 @@ import time
 from tqdm import tqdm
 from pathlib import Path
 import traceback
+import GPUtil
 from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
 
 SERVER_TYPES = (
@@ -288,11 +289,32 @@ def main():
     if len(batch):
         batched_data.append(batch)
 
+    def get_free_memory():
+        """Returns the free memory available on the GPU."""
+        gpus = GPUtil.getGPUs()
+        if len(gpus) == 0:
+            return 0
+        return gpus[0].memoryFree
+
+    def get_dynamic_batch_size(initial_batch_size=1, max_batch_size=64, min_batch_size=1, target_memory_utilization=0.4):
+        # Get available GPU memories
+        free_memory = get_free_memory()
+        total_memory = GPUtil.getGPUs()[0].memoryTotal
+        used_memory = total_memory - free_memory
+        memory_utilization = used_memory / total_memory
+
+        # adjust batch size
+        if memory_utilization > target_memory_utilization * 2:
+            new_batch_size = max(min_batch_size, initial_batch_size / 2)
+        elif memory_utilization < target_memory_utilization:
+            new_batch_size = min(max_batch_size, initial_batch_size * 2)
+
+        return new_batch_size
+    
     # setting buffering=1 to force to dump the output after every line, so that we can see intermediate generations
     with open(pred_file, 'at', encoding="utf-8", buffering=1) as fout:
         # the data is processed sequentially, so we can store the start and end of current processing window
         start_idx = 0  # window: [start_idx, end_idx]
-
         for batch_idx, batch in tqdm(enumerate(batched_data), total=len(batched_data)):
             idx_list = [data_point['idx'] for data_point in batch]
             end_idx = idx_list[-1]  # the data in a batch is ordered
@@ -319,12 +341,16 @@ def main():
                     thread.join()
                 threads = []
 
+                # get the target batch size for the next round
+                target_batch_size = get_dynamic_batch_size(args.batch_size)
+                
                 # dump the results in current processing window on disk
                 for idx in range(start_idx, end_idx + 1):
                     if len(outputs_parallel[idx]) > 0:
                         fout.write(json.dumps(outputs_parallel[idx]) + '\n')
 
                 start_idx = end_idx + 1
+        os.environ['CURRENT_BATCH_SIZE'] = target_batch_size
 
     print(f"Used time: {round((time.time() - start_time) / 60, 1)} minutes")
 

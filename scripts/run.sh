@@ -122,6 +122,7 @@ for MAX_SEQ_LENGTH in "${SEQ_LENGTHS[@]}"; do
         end_time=$(date +%s)
         time_diff=$((end_time - start_time))
         total_time=$((total_time + time_diff))
+        BATCH_SIZE=${CURRENT_BATCH_SIZE}
     done
     
     python eval/evaluate.py \
