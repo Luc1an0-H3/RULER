@@ -303,6 +303,7 @@ def main():
         used_memory = total_memory - free_memory
         memory_utilization = used_memory / total_memory
 
+        new_batch_size = initial_batch_size
         # adjust batch size
         if memory_utilization > target_memory_utilization * 2:
             new_batch_size = max(min_batch_size, initial_batch_size / 2)
