@@ -329,9 +329,10 @@ def hf_main():
                 'truncation': truncation,
                 'length': length,
             }
-        for idx in range(start_idx, end_idx + 1):
-                    if len(outputs_parallel[idx]) > 0:
-                        fout.write(json.dumps(outputs_parallel[idx]) + '\n')      
+        with open(pred_file, 'at', encoding="utf-8", buffering=1) as fout:
+            for idx in range(start_idx, end_idx + 1):
+                        if len(outputs_parallel[idx]) > 0:
+                            fout.write(json.dumps(outputs_parallel[idx]) + '\n')      
     get_output()
     print(f"Used time: {round((time.time() - start_time) / 60, 1)} minutes")
 
