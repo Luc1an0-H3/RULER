@@ -199,6 +199,141 @@ def get_llm(tokens_to_generate):
 
     return llm
 
+def get_free_memory():
+        """Returns the free memory available on the GPU."""
+        gpus = GPUtil.getGPUs()
+        if len(gpus) == 0:
+            return 0
+        return gpus[0].memoryFree
+
+def get_dynamic_batch_size(initial_batch_size=1, max_batch_size=64, min_batch_size=1, target_memory_utilization=0.4):
+    # Get available GPU memories
+    free_memory = get_free_memory()
+    total_memory = GPUtil.getGPUs()[0].memoryTotal
+    used_memory = total_memory - free_memory
+    memory_utilization = used_memory / total_memory
+
+    new_batch_size = initial_batch_size
+    # adjust batch size
+    if memory_utilization > target_memory_utilization * 2:
+        new_batch_size = max(min_batch_size, initial_batch_size / 2)
+    elif memory_utilization < target_memory_utilization:
+        new_batch_size = min(max_batch_size, initial_batch_size * 2)
+
+    return new_batch_size
+
+def hf_main():
+    start_time = time.time()
+    curr_folder = os.path.dirname(os.path.abspath(__file__))
+
+    try:
+        sys.path.append(os.path.dirname(curr_folder))
+        module = importlib.import_module(f"data.{args.benchmark}.constants")
+    except ImportError:
+        print(f"Module data.{args.benchmark}.constants not found.")
+
+    tasks_base = module.TASKS
+    with open(os.path.join(curr_folder, f"../{args.benchmark}.yaml"), "r") as f:
+        tasks_customized = yaml.safe_load(f)
+
+    if args.task not in tasks_customized:
+        raise ValueError(f'{args.task} is not found in config_tasks.yaml')
+        
+    config = tasks_customized.get(args.task)
+    config.update(tasks_base[config['task']])
+
+    task_file = args.data_dir / args.task / f'{args.subset}.jsonl'
+    
+    if args.chunk_amount > 1:
+        pred_file = args.save_dir / f'{args.task}-{args.chunk_idx}.jsonl'
+    else:
+        pred_file = args.save_dir / f'{args.task}.jsonl'
+        
+    print(f'Predict {args.task} \nfrom {task_file}\nto {pred_file}')
+    pred_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load data
+    if os.path.exists(pred_file):
+        pred_index = [sample['index'] for sample in read_manifest(pred_file)]
+        data = [sample for sample in read_manifest(task_file) if sample['index'] not in pred_index]
+    else:
+        data = read_manifest(task_file)
+
+    # Load api
+    llm = get_llm(config['tokens_to_generate'])
+
+    def batch_data(data, processing_batch_size = args.batch_size, start_idx = 0):
+        if start_idx+processing_batch_size-1 <= len(data)-1:
+            batch = data[start_idx:start_idx + processing_batch_size]
+        else:
+            batch = data[start_idx:]
+        for data_point in batch:
+                data_point['idx'] = start_idx
+                start_idx = start_idx + 1
+        return batch, start_idx
+
+    def get_output(max_batch_size = 64):
+        nonlocal llm
+        start_idx = 0
+        outputs_parallel = [{} for _ in range(len(data))]
+        current_batch_size = args.batch_size
+        while start_idx <= len(data):
+            try:
+                if current_batch_size == max_batch_size:
+                    break 
+                #batch the data with new batchsize as input list
+                start_idx,batch = batch_data(data,current_batch_size,start_idx)
+                input_list=[data_point['input'] for data_point in batch]
+
+                pred_list = llm.process_batch(prompts=input_list)
+                current_batch_size = current_batch_size * 2
+            except MemoryError as e:
+                traceback.print_exc()
+                print("Trying batch size is {current_batch_size}.")
+                current_batch_size = current_batch_size // 2
+                #batch the data with new batchsize as input list
+                start_idx,batch = batch_data(data,current_batch_size,start_idx)
+                input_list=[data_point['input'] for data_point in batch]
+
+                pred_list = llm.process_batch(prompts=input_list)
+                break
+            except Exception as e:
+                traceback.print_exc()
+        idx_list = [data_point['idx'] for data_point in batch]
+        end_idx = idx_list[-1]
+        idx_list=idx_list
+        index_list=[data_point['index'] for data_point in batch]
+        input_list=[data_point['input'] for data_point in batch]
+        outputs_list=[data_point['outputs'] for data_point in batch]
+        others_list=[data_point.get('others', {}) for data_point in batch]
+        truncation_list=[data_point.get('truncation', -1) for data_point in batch]
+        length_list=[data_point.get('length', -1) for data_point in batch]
+
+        zipped_iter = zip(pred_list, idx_list, index_list, input_list,
+                          outputs_list, others_list, truncation_list, length_list)
+
+        for pred, idx, index, input, outputs, others, truncation, length in zipped_iter:
+            if isinstance(pred['text'], str):
+                pred_text = pred['text']
+            elif len(pred['text']) > 0:
+                pred_text = pred['text'][0]
+            else:
+                pred_text = ''
+
+            outputs_parallel[idx] = {
+                'index': index,
+                'pred': pred_text,
+                'input': input,
+                'outputs': outputs,
+                'others': others,
+                'truncation': truncation,
+                'length': length,
+            }
+        for idx in range(start_idx, end_idx + 1):
+                    if len(outputs_parallel[idx]) > 0:
+                        fout.write(json.dumps(outputs_parallel[idx]) + '\n')      
+    get_output()
+    print(f"Used time: {round((time.time() - start_time) / 60, 1)} minutes")
 
 def main():
     start_time = time.time()
@@ -288,29 +423,6 @@ def main():
 
     if len(batch):
         batched_data.append(batch)
-
-    def get_free_memory():
-        """Returns the free memory available on the GPU."""
-        gpus = GPUtil.getGPUs()
-        if len(gpus) == 0:
-            return 0
-        return gpus[0].memoryFree
-
-    def get_dynamic_batch_size(initial_batch_size=1, max_batch_size=64, min_batch_size=1, target_memory_utilization=0.4):
-        # Get available GPU memories
-        free_memory = get_free_memory()
-        total_memory = GPUtil.getGPUs()[0].memoryTotal
-        used_memory = total_memory - free_memory
-        memory_utilization = used_memory / total_memory
-
-        new_batch_size = initial_batch_size
-        # adjust batch size
-        if memory_utilization > target_memory_utilization * 2:
-            new_batch_size = max(min_batch_size, initial_batch_size / 2)
-        elif memory_utilization < target_memory_utilization:
-            new_batch_size = min(max_batch_size, initial_batch_size * 2)
-
-        return new_batch_size
     
     # setting buffering=1 to force to dump the output after every line, so that we can see intermediate generations
     with open(pred_file, 'at', encoding="utf-8", buffering=1) as fout:
@@ -341,20 +453,17 @@ def main():
                 for thread in threads:
                     thread.join()
                 threads = []
-
-                # get the target batch size for the next round
-                target_batch_size = get_dynamic_batch_size(args.batch_size)
-                
                 # dump the results in current processing window on disk
                 for idx in range(start_idx, end_idx + 1):
                     if len(outputs_parallel[idx]) > 0:
                         fout.write(json.dumps(outputs_parallel[idx]) + '\n')
-
                 start_idx = end_idx + 1
-        os.environ['CURRENT_BATCH_SIZE'] = target_batch_size
 
     print(f"Used time: {round((time.time() - start_time) / 60, 1)} minutes")
 
 
+
 if __name__ == '__main__':
-    main()
+    if args.server_type == 'hf':
+        hf_main()
+    else: main()
